@@ -1,0 +1,76 @@
+{
+  "name": "code-agent-logger",
+  "displayName": "Code Agent Logger",
+  "description": "Send prompts, Copilot/Codex chats, errors, and summaries to your local code-agent sidecar.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.89.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:codeAgent.logPrompt",
+    "onCommand:codeAgent.logCopilotChat",
+    "onCommand:codeAgent.logError",
+    "onCommand:codeAgent.runSummary",
+    "onCommand:codeAgent.showLatestSummary"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeAgent.logPrompt",
+        "title": "Agent: Log Prompt (selection or input)"
+      },
+      {
+        "command": "codeAgent.logCopilotChat",
+        "title": "Agent: Log Copilot/Codex Chat"
+      },
+      {
+        "command": "codeAgent.logError",
+        "title": "Agent: Log Error"
+      },
+      {
+        "command": "codeAgent.runSummary",
+        "title": "Agent: Run Project Summary"
+      },
+      {
+        "command": "codeAgent.showLatestSummary",
+        "title": "Agent: Show Latest Summary"
+      }
+    ],
+    "configuration": {
+      "title": "Code Agent Logger",
+      "properties": {
+        "codeAgent.endpoint": {
+          "type": "string",
+          "default": "http://localhost:4381",
+          "description": "Base URL of the code-agent API (no trailing slash)."
+        },
+        "codeAgent.source": {
+          "type": "string",
+          "default": "vscode",
+          "description": "Source label stored with events (e.g., vscode, copilot, codex)."
+        },
+        "codeAgent.defaultModel": {
+          "type": "string",
+          "default": "claude-code",
+          "description": "Default model name for prompt events."
+        },
+        "codeAgent.defaultCopilotModel": {
+          "type": "string",
+          "default": "copilot",
+          "description": "Default model name for Copilot/Codex chat events."
+        },
+        "codeAgent.conversationId": {
+          "type": "string",
+          "default": "",
+          "description": "Optional conversation/session id to tag Copilot/Codex chat events."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.89.0"
+  }
+}

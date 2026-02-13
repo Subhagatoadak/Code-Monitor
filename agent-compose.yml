@@ -1,0 +1,17 @@
+services:
+  code-agent:
+    build: ./.agent
+    volumes:
+      - .:/workspace:ro
+      - ./.agent/data:/data
+    environment:
+      REPO_PATH: /workspace
+      DB_PATH: /data/events.db
+      PORT: 4381
+      SUMMARY_EVENT_LIMIT: 50
+      SUMMARY_CHAR_LIMIT: 6000
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}   # set in your shell to enable summaries
+      # OPENAI_MODEL: gpt-4o-mini
+    ports:
+      - "4381:4381"
+    restart: unless-stopped
