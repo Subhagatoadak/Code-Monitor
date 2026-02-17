@@ -1,0 +1,631 @@
+import asyncio
+import difflib
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from git import InvalidGitRepositoryError, Repo
+from openai import OpenAI
+from sse_starlette.sse import EventSourceResponse
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+# Load .env file from project root
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+APP_TITLE = "Code Activity Agent"
+REPO_PATH = Path(os.environ.get("REPO_PATH", "/workspace")).resolve()
+DB_PATH = Path(os.environ.get("DB_PATH", "/data/events.db")).resolve()
+PORT = int(os.environ.get("PORT", "4381"))
+MAX_BYTES = int(os.environ.get("MAX_BYTES", 2_000_000))  # skip very large files
+IGNORE_PARTS = set(
+    os.environ.get(
+        "IGNORE_PARTS",
+        ".git,.agent,node_modules,.venv,.idea,.vscode,__pycache__"
+    ).split(",")
+)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+SUMMARY_EVENT_LIMIT = int(os.environ.get("SUMMARY_EVENT_LIMIT", 50))
+SUMMARY_CHAR_LIMIT = int(os.environ.get("SUMMARY_CHAR_LIMIT", 6000))
+
+app = FastAPI(title=APP_TITLE)
+
+# Add CORS middleware for development
+if os.environ.get("CORS_ENABLED", "false").lower() == "true":
+    origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# SSE event queue for real-time updates
+sse_queues: List[asyncio.Queue] = []
+
+
+async def broadcast_event(event_data: dict) -> None:
+    """Broadcast event to all connected SSE clients"""
+    dead_queues = []
+    for queue in sse_queues:
+        try:
+            await asyncio.wait_for(queue.put(event_data), timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            dead_queues.append(queue)
+
+    # Clean up disconnected clients
+    for queue in dead_queues:
+        sse_queues.remove(queue)
+
+
+class PromptEvent(BaseModel):
+    text: str
+    source: str = "manual"
+    model: str = "claude"
+
+
+class CopilotEvent(BaseModel):
+    prompt: str
+    response: str
+    source: str = "copilot-chat"
+    model: str = "copilot"
+    conversation_id: str = ""
+
+
+class ErrorEvent(BaseModel):
+    message: str
+    context: Dict[str, Any] = {}
+
+# Try to attach to git repo if present.
+try:
+    repo: Optional[Repo] = Repo(REPO_PATH)
+except InvalidGitRepositoryError:
+    repo = None
+
+
+def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            create table if not exists events (
+              id integer primary key,
+              ts integer,
+              kind text,
+              path text,
+              payload text
+            )
+            """
+        )
+        conn.execute("create index if not exists idx_events_ts on events(ts)")
+
+
+def log_event(kind: str, path: str, payload: Dict) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "insert into events(ts, kind, path, payload) values (?, ?, ?, ?)",
+            (int(time.time()), kind, path, json.dumps(payload)),
+        )
+
+
+def log_event_with_broadcast(kind: str, path: str, payload: Dict) -> int:
+    """Log event to DB and broadcast to SSE clients"""
+    event_id = None
+    ts = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "insert into events(ts, kind, path, payload) values (?, ?, ?, ?)",
+            (ts, kind, path, json.dumps(payload)),
+        )
+        event_id = cursor.lastrowid
+
+    # Broadcast to SSE clients
+    event_data = {
+        "id": event_id,
+        "ts": ts_to_iso(ts),
+        "kind": kind,
+        "path": path,
+        "payload": payload
+    }
+    asyncio.create_task(broadcast_event(event_data))
+
+    return event_id
+
+
+def ts_to_iso(ts: int) -> str:
+    return datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+
+def safe_trim(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def build_event_digest(limit: int = SUMMARY_EVENT_LIMIT, char_limit: int = SUMMARY_CHAR_LIMIT) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "select ts, kind, path, payload from events order by ts desc limit ?",
+            (limit,),
+        ).fetchall()
+
+    lines = []
+    for ts, kind, path, payload in rows:
+        try:
+            data: Dict[str, Any] = json.loads(payload or "{}")
+        except json.JSONDecodeError:
+            data = {}
+
+        snippet = ""
+        if kind == "file_change":
+            snippet = f"{data.get('event', '')}; diff={safe_trim(data.get('diff', ''), 400)}"
+        elif kind == "file_deleted":
+            snippet = "deleted"
+        elif kind == "prompt":
+            snippet = safe_trim(data.get("text", ""), 300)
+        elif kind == "copilot_chat":
+            snippet = f"prompt={safe_trim(data.get('prompt', ''), 200)} | reply={safe_trim(data.get('response', ''), 200)}"
+        elif kind == "error":
+            snippet = safe_trim(data.get("message", ""), 200)
+        elif kind == "summary":
+            snippet = safe_trim(data.get("content", ""), 200)
+
+        lines.append(f"{ts_to_iso(int(ts))} | {kind} | {path or '-'} | {snippet}")
+
+        if sum(len(l) for l in lines) > char_limit:
+            lines.append("...[truncated digest]")
+            break
+
+    commit_line = ""
+    if repo and repo.head.is_valid():
+        commit = repo.head.commit
+        commit_line = f"Latest commit: {commit.hexsha[:7]} {commit.summary}"
+
+    header = [
+        f"Repo: {REPO_PATH}",
+        commit_line,
+        f"Recent events (limit {limit}):",
+    ]
+    digest = "\n".join([line for line in header if line] + lines)
+    return safe_trim(digest, char_limit)
+
+
+def generate_summary() -> str:
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=400, detail="OPENAI_API_KEY is required for summaries")
+
+    digest = build_event_digest()
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a diligent software project journaler. "
+                "Given recent repository events, produce a concise, bullet-style summary "
+                "covering changed areas, notable diffs, prompts/conversations, and errors. "
+                "Keep it under 200 words. If information is missing, state that briefly."
+            ),
+        },
+        {"role": "user", "content": digest},
+    ]
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=400,
+    )
+    summary = response.choices[0].message.content.strip()
+    log_event_with_broadcast("summary", "", {"content": summary, "model": OPENAI_MODEL})
+    return summary
+
+class FileHandler(FileSystemEventHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cache: Dict[str, str] = {}
+
+    def _should_ignore(self, path: Path) -> bool:
+        return any(part in IGNORE_PARTS for part in path.parts)
+
+    def _read_text(self, path: Path) -> str:
+        try:
+            if path.stat().st_size > MAX_BYTES:
+                return ""
+            return path.read_text(errors="ignore")
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    def _baseline_from_git(self, path: Path) -> str:
+        if repo is None:
+            return ""
+        try:
+            rel = path.relative_to(REPO_PATH)
+            return repo.git.show(f"HEAD:{rel}")
+        except Exception:
+            return ""
+
+    def _log_diff(self, path: Path, new_content: str, event: str) -> None:
+        key = str(path)
+        old_content = self.cache.get(key)
+        baseline_label = "cache"
+        if old_content is None:
+            old_content = self._baseline_from_git(path)
+            baseline_label = "head"
+
+        def make_diff(old: str, new: str) -> str:
+            return "\n".join(
+                difflib.unified_diff(
+                    (old or "").splitlines(),
+                    (new or "").splitlines(),
+                    fromfile="old",
+                    tofile="new",
+                    lineterm="",
+                )
+            )
+
+        diff = make_diff(old_content or "", new_content or "")
+
+        # If nothing changed vs cached content but file differs from HEAD, fallback to HEAD diff.
+        if not diff and repo is not None:
+            head_content = self._baseline_from_git(path)
+            if head_content != new_content:
+                diff = make_diff(head_content or "", new_content or "")
+                baseline_label = "head"
+
+        self.cache[key] = new_content
+        log_event_with_broadcast(
+            kind="file_change",
+            path=str(path.relative_to(REPO_PATH)) if path.exists() else str(path),
+            payload={
+                "event": event,
+                "diff": diff,
+                "sha": sha256(new_content.encode("utf-8", "ignore")).hexdigest(),
+                "size": len(new_content.encode("utf-8", "ignore")),
+                "baseline": baseline_label,
+            },
+        )
+
+    def on_modified(self, event):  # type: ignore[override]
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        if self._should_ignore(path):
+            return
+        content = self._read_text(path)
+        self._log_diff(path, content, "modified")
+
+    def on_created(self, event):  # type: ignore[override]
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        if self._should_ignore(path):
+            return
+        content = self._read_text(path)
+        self._log_diff(path, content, "created")
+
+    def on_deleted(self, event):  # type: ignore[override]
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        if self._should_ignore(path):
+            return
+        log_event_with_broadcast(
+            kind="file_deleted",
+            path=str(path.relative_to(REPO_PATH)),
+            payload={"event": "deleted"},
+        )
+        self.cache.pop(str(path), None)
+
+
+# --- API endpoints --------------------------------------------------------
+
+@app.post("/prompt")
+def capture_prompt(event: PromptEvent):
+    log_event_with_broadcast("prompt", "", {"text": event.text, "source": event.source, "model": event.model})
+    return {"status": "ok"}
+
+
+@app.post("/copilot")
+def capture_copilot(event: CopilotEvent):
+    log_event_with_broadcast(
+        "copilot_chat",
+        "",
+        {
+            "prompt": event.prompt,
+            "response": event.response,
+            "source": event.source,
+            "model": event.model,
+            "conversation_id": event.conversation_id,
+        },
+    )
+    return {"status": "ok"}
+
+
+@app.post("/error")
+def capture_error(event: ErrorEvent):  # type: ignore[assignment]
+    log_event_with_broadcast("error", "", {"message": event.message, "context": event.context})
+    return {"status": "ok"}
+
+
+@app.post("/summary/run")
+def summary_run():
+    summary = generate_summary()
+    return {"summary": summary}
+
+
+@app.get("/summary/latest")
+def summary_latest():
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "select ts, payload from events where kind='summary' order by ts desc limit 1"
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="No summary available yet")
+    ts, payload = row
+    try:
+        data: Dict[str, Any] = json.loads(payload or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    return {
+        "ts": ts_to_iso(int(ts)),
+        "content": data.get("content", ""),
+        "model": data.get("model", OPENAI_MODEL),
+    }
+
+
+@app.get("/events")
+def list_events(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    kind: str = Query("", description="Optional kind filter, e.g., file_change,prompt,error,copilot_chat,summary"),
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        base = "select ts, kind, path, payload from events"
+        params = []
+        if kind:
+            base += " where kind = ?"
+            params.append(kind)
+        base += " order by ts desc limit ? offset ?"
+        params.extend([limit, offset])
+        rows = conn.execute(base, params).fetchall()
+
+        events = []
+        for ts, k, path, payload in rows:
+            try:
+                data: Dict[str, Any] = json.loads(payload or "{}")
+            except json.JSONDecodeError:
+                data = {"raw": payload}
+            events.append(
+                {
+                    "ts": ts_to_iso(int(ts)),
+                    "kind": k,
+                    "path": path,
+                    "payload": data,
+                }
+            )
+    return {"items": events, "count": len(events), "limit": limit, "offset": offset}
+
+
+@app.get("/events/stream")
+async def stream_events():
+    """Server-Sent Events endpoint for real-time event streaming"""
+    async def event_generator():
+        queue = asyncio.Queue()
+        sse_queues.append(queue)
+
+        try:
+            while True:
+                event_data = await queue.get()
+                yield {
+                    "event": "message",
+                    "data": json.dumps(event_data)
+                }
+        except asyncio.CancelledError:
+            sse_queues.remove(queue)
+            raise
+
+    return EventSourceResponse(event_generator())
+
+
+class MatchRequest(BaseModel):
+    start_ts: Optional[int] = None
+    end_ts: Optional[int] = None
+    event_ids: Optional[List[int]] = None
+    include_kinds: List[str] = ["prompt", "copilot_chat", "file_change"]
+
+
+@app.post("/match")
+async def match_events(request: MatchRequest):
+    """Use GPT-4 to semantically match prompts/chats with code changes"""
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=400, detail="OPENAI_API_KEY required for matching")
+
+    # Fetch events from database
+    with sqlite3.connect(DB_PATH) as conn:
+        query_parts = ["SELECT id, ts, kind, path, payload FROM events WHERE kind IN ({})".format(
+            ",".join(["?" for _ in request.include_kinds])
+        )]
+        params = list(request.include_kinds)
+
+        if request.start_ts:
+            query_parts.append("AND ts >= ?")
+            params.append(request.start_ts)
+
+        if request.end_ts:
+            query_parts.append("AND ts <= ?")
+            params.append(request.end_ts)
+
+        if request.event_ids:
+            query_parts.append("AND id IN ({})".format(",".join(["?" for _ in request.event_ids])))
+            params.extend(request.event_ids)
+
+        query_parts.append("ORDER BY ts DESC LIMIT 100")
+
+        rows = conn.execute(" ".join(query_parts), params).fetchall()
+
+    # Organize events by type
+    prompts = []
+    code_changes = []
+
+    for event_id, ts, kind, path, payload_str in rows:
+        try:
+            payload = json.loads(payload_str or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+
+        event_obj = {
+            "id": event_id,
+            "ts": ts,
+            "ts_iso": ts_to_iso(ts),
+            "kind": kind,
+            "path": path,
+            "payload": payload
+        }
+
+        if kind in ["prompt", "copilot_chat"]:
+            prompts.append(event_obj)
+        elif kind == "file_change":
+            code_changes.append(event_obj)
+
+    if not prompts or not code_changes:
+        return {"matches": [], "message": "Insufficient events for matching"}
+
+    # Build GPT-4 matching prompt
+    matching_prompt = build_matching_prompt(prompts, code_changes)
+
+    # Call GPT-4 for semantic analysis
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    model = os.environ.get("OPENAI_MATCHING_MODEL", "gpt-4o")
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert code analyst. Analyze semantic relationships "
+                        "between developer prompts/chats and code changes. Return JSON array "
+                        "of matches with confidence scores (0-1) and reasoning. "
+                        "Only include matches with confidence >= 0.6."
+                    )
+                },
+                {"role": "user", "content": matching_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        matches = result.get("matches", [])
+
+        # Log the matching operation
+        log_event_with_broadcast(
+            "ai_match",
+            "",
+            {
+                "model": model,
+                "prompt_count": len(prompts),
+                "code_change_count": len(code_changes),
+                "match_count": len(matches)
+            }
+        )
+
+        return {
+            "matches": matches,
+            "metadata": {
+                "model": model,
+                "prompt_count": len(prompts),
+                "code_change_count": len(code_changes)
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Matching failed: {str(e)}")
+
+
+def build_matching_prompt(prompts: List[dict], code_changes: List[dict]) -> str:
+    """Build prompt for GPT-4 semantic matching"""
+    lines = ["# Developer Prompts/Chats:\n"]
+
+    for p in prompts:
+        if p["kind"] == "prompt":
+            text = p["payload"].get("text", "")[:300]
+            lines.append(f"[Prompt {p['id']}] ({p['ts_iso']}): {text}")
+        elif p["kind"] == "copilot_chat":
+            prompt_text = p["payload"].get("prompt", "")[:200]
+            response_text = p["payload"].get("response", "")[:200]
+            lines.append(f"[Chat {p['id']}] ({p['ts_iso']}) Q: {prompt_text} A: {response_text}")
+
+    lines.append("\n# Code Changes:\n")
+
+    for c in code_changes:
+        diff = c["payload"].get("diff", "")[:400]
+        lines.append(f"[Change {c['id']}] ({c['ts_iso']}) {c['path']}")
+        lines.append(diff)
+        lines.append("")
+
+    lines.append('\n# Task: Return JSON: {"matches": [{"prompt_id": 123, "code_change_ids": [456], "confidence": 0.85, "reasoning": "brief explanation"}]}')
+
+    return "\n".join(lines)
+
+
+@app.get("/health")
+def health():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("select count(*) from events")
+        total = cur.fetchone()[0]
+    return {"status": "up", "events": total}
+
+
+# --- Static file serving for frontend -----------------------------------
+
+FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/", response_class=FileResponse)
+    async def serve_frontend():
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+    @app.get("/{full_path:path}", response_class=FileResponse)
+    async def serve_spa(full_path: str):
+        """Serve index.html for all non-API routes (SPA routing)"""
+        file_path = FRONTEND_DIST / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path)
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+
+# --- bootstrap -----------------------------------------------------------
+
+def main() -> None:
+    init_db()
+    handler = FileHandler()
+    observer = Observer()
+    observer.schedule(handler, str(REPO_PATH), recursive=True)
+    observer.start()
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    finally:
+        observer.stop()
+        observer.join()
+
+
+if __name__ == "__main__":
+    main()

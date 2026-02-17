@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./.agent
+      dockerfile: Dockerfile
+    container_name: code-monitor-backend
+    volumes:
+      - .:/workspace
+      - ./.agent/data:/data
+      # Mount your projects directory - UPDATE THIS PATH if your projects are elsewhere
+      - /Users/subhagatoadak/Documents/github:/projects:ro
+    environment:
+      REPO_PATH: /workspace
+      DB_PATH: /data/events.db
+      PORT: 4381
+      SUMMARY_EVENT_LIMIT: 50
+      SUMMARY_CHAR_LIMIT: 6000
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_MATCHING_MODEL: ${OPENAI_MATCHING_MODEL:-gpt-4o}
+      CORS_ENABLED: ${CORS_ENABLED:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      # Remove .agent from ignore list to monitor backend changes
+      IGNORE_PARTS: .git,node_modules,.venv,.idea,.vscode,__pycache__
+    ports:
+      - "4381:4381"
+    networks:
+      - code-monitor-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4381/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: code-monitor-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_BASE_URL=http://localhost:4381
+    ports:
+      - "5173:5173"
+    networks:
+      - code-monitor-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    command: npm run dev -- --host
+
+networks:
+  code-monitor-network:
+    driver: bridge
+
+volumes:
+  node_modules:

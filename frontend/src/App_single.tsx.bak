@@ -1,0 +1,567 @@
+import { useEffect, useState } from 'react'
+import { useQuery, useMutation } from '@tanstack/react-query'
+import { motion, AnimatePresence } from 'framer-motion'
+import { Toaster, toast } from 'sonner'
+import confetti from 'canvas-confetti'
+import {
+  FileText,
+  MessageSquare,
+  AlertCircle,
+  Sparkles,
+  Plus,
+  Search,
+  Filter,
+  Activity,
+  Trash2,
+} from 'lucide-react'
+import { useEventStore } from './store/eventStore'
+import { createEventStream } from './lib/eventStream'
+import { fetchEvents, logPrompt, logCopilotChat, matchEvents, healthCheck } from './lib/api'
+import { formatRelativeTime, cn } from './lib/utils'
+import type { Event, EventKind } from './types/events'
+
+// Event color configuration
+const EVENT_CONFIG = {
+  file_change: {
+    icon: FileText,
+    gradient: 'from-blue-500 to-cyan-400',
+    bg: 'bg-blue-500/10',
+    label: 'File Change',
+  },
+  file_deleted: {
+    icon: Trash2,
+    gradient: 'from-gray-500 to-slate-400',
+    bg: 'bg-gray-500/10',
+    label: 'File Deleted',
+  },
+  prompt: {
+    icon: Sparkles,
+    gradient: 'from-purple-500 to-pink-400',
+    bg: 'bg-purple-500/10',
+    label: 'Prompt',
+  },
+  copilot_chat: {
+    icon: MessageSquare,
+    gradient: 'from-pink-500 to-rose-400',
+    bg: 'bg-pink-500/10',
+    label: 'Chat',
+  },
+  error: {
+    icon: AlertCircle,
+    gradient: 'from-red-500 to-orange-400',
+    bg: 'bg-red-500/10',
+    label: 'Error',
+  },
+  summary: {
+    icon: Activity,
+    gradient: 'from-green-500 to-emerald-400',
+    bg: 'bg-green-500/10',
+    label: 'Summary',
+  },
+  ai_match: {
+    icon: Sparkles,
+    gradient: 'from-violet-500 via-fuchsia-500 to-pink-500',
+    bg: 'bg-fuchsia-500/10',
+    label: 'AI Match',
+  },
+}
+
+function EventCard({ event }: { event: Event }) {
+  const config = EVENT_CONFIG[event.kind as EventKind] || EVENT_CONFIG.file_change
+  const Icon = config.icon
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -20 }}
+      whileHover={{ scale: 1.01 }}
+      className={cn('rounded-2xl p-6 glass border shadow-xl transition-all duration-200', config.bg)}
+    >
+      <div className="flex items-start gap-4">
+        <div className={`p-3 rounded-xl bg-gradient-to-br ${config.gradient} shadow-lg flex-shrink-0`}>
+          <Icon className="w-6 h-6 text-white" />
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="font-semibold text-lg">{config.label}</h3>
+            <span className="text-sm text-gray-400">{formatRelativeTime(event.ts)}</span>
+          </div>
+
+          {event.path && (
+            <p className="text-sm text-gray-400 mb-2 font-mono truncate">{event.path}</p>
+          )}
+
+          {/* Render specific content based on event type */}
+          {event.kind === 'file_change' && (
+            <div className="mt-2">
+              <p className="text-sm text-gray-300 mb-1">
+                <span className="font-semibold">{event.payload.event}</span> •{' '}
+                {event.payload.size} bytes
+              </p>
+              {event.payload.diff && (
+                <div>
+                  <button
+                    onClick={() => setExpanded(!expanded)}
+                    className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
+                  >
+                    {expanded ? 'Hide' : 'Show'} diff
+                  </button>
+                  {expanded && (
+                    <motion.pre
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      className="mt-2 p-3 bg-black/30 rounded-lg text-xs overflow-x-auto max-h-96 overflow-y-auto"
+                    >
+                      <code className="text-gray-300">{event.payload.diff}</code>
+                    </motion.pre>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {event.kind === 'prompt' && (
+            <div className="mt-2">
+              <p className="text-sm text-gray-300 whitespace-pre-wrap">{event.payload.text}</p>
+              <p className="text-xs text-gray-500 mt-1">
+                {event.payload.source} • {event.payload.model}
+              </p>
+            </div>
+          )}
+
+          {event.kind === 'copilot_chat' && (
+            <div className="mt-2 space-y-2">
+              <div className="p-2 bg-purple-500/10 rounded-lg">
+                <p className="text-xs text-purple-300 font-semibold mb-1">Question:</p>
+                <p className="text-sm text-gray-300">{event.payload.prompt}</p>
+              </div>
+              <div className="p-2 bg-pink-500/10 rounded-lg">
+                <p className="text-xs text-pink-300 font-semibold mb-1">Answer:</p>
+                <p className="text-sm text-gray-300">{event.payload.response}</p>
+              </div>
+            </div>
+          )}
+
+          {event.kind === 'error' && (
+            <div className="mt-2">
+              <p className="text-sm text-red-300">{event.payload.message}</p>
+            </div>
+          )}
+
+          {event.kind === 'summary' && (
+            <div className="mt-2">
+              <p className="text-sm text-gray-300 whitespace-pre-wrap">{event.payload.content}</p>
+            </div>
+          )}
+
+          {event.kind === 'ai_match' && (
+            <div className="mt-2">
+              <p className="text-sm text-gray-300">
+                Matched {event.payload.match_count} correlations between{' '}
+                {event.payload.prompt_count} prompts and {event.payload.code_change_count} code changes
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  )
+}
+
+function LoggerModal({ onClose }: { onClose: () => void }) {
+  const [activeTab, setActiveTab] = useState<'prompt' | 'chat'>('prompt')
+  const [promptData, setPromptData] = useState({ text: '', source: 'web', model: 'claude' })
+  const [chatData, setChatData] = useState({ prompt: '', response: '', source: 'web', model: 'claude' })
+
+  const promptMutation = useMutation({
+    mutationFn: logPrompt,
+    onSuccess: () => {
+      toast.success('Prompt logged successfully!')
+      confetti({ particleCount: 50, spread: 60 })
+      onClose()
+    },
+  })
+
+  const chatMutation = useMutation({
+    mutationFn: logCopilotChat,
+    onSuccess: () => {
+      toast.success('Chat logged successfully!')
+      confetti({ particleCount: 50, spread: 60 })
+      onClose()
+    },
+  })
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ scale: 0.9, y: 20 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.9, y: 20 }}
+        onClick={(e) => e.stopPropagation()}
+        className="bg-gradient-to-br from-gray-900 to-gray-800 rounded-3xl p-6 max-w-2xl w-full glass border shadow-2xl"
+      >
+        <h2 className="text-2xl font-bold mb-4 bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
+          Log Activity
+        </h2>
+
+        <div className="flex gap-2 mb-4">
+          <button
+            onClick={() => setActiveTab('prompt')}
+            className={cn(
+              'px-4 py-2 rounded-xl transition-all',
+              activeTab === 'prompt'
+                ? 'bg-gradient-to-r from-purple-500 to-pink-500 text-white'
+                : 'bg-white/5 text-gray-400 hover:bg-white/10'
+            )}
+          >
+            Prompt
+          </button>
+          <button
+            onClick={() => setActiveTab('chat')}
+            className={cn(
+              'px-4 py-2 rounded-xl transition-all',
+              activeTab === 'chat'
+                ? 'bg-gradient-to-r from-pink-500 to-rose-500 text-white'
+                : 'bg-white/5 text-gray-400 hover:bg-white/10'
+            )}
+          >
+            Chat
+          </button>
+        </div>
+
+        {activeTab === 'prompt' && (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Prompt Text</label>
+              <textarea
+                value={promptData.text}
+                onChange={(e) => setPromptData({ ...promptData, text: e.target.value })}
+                className="w-full h-32 px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                placeholder="Enter your prompt..."
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Source</label>
+                <input
+                  type="text"
+                  value={promptData.source}
+                  onChange={(e) => setPromptData({ ...promptData, source: e.target.value })}
+                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Model</label>
+                <input
+                  type="text"
+                  value={promptData.model}
+                  onChange={(e) => setPromptData({ ...promptData, model: e.target.value })}
+                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => promptMutation.mutate(promptData)}
+                disabled={!promptData.text || promptMutation.isPending}
+                className="flex-1 px-6 py-3 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {promptMutation.isPending ? 'Logging...' : 'Log Prompt'}
+              </button>
+              <button
+                onClick={onClose}
+                className="px-6 py-3 bg-white/5 text-gray-300 rounded-xl font-semibold hover:bg-white/10 transition-all"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'chat' && (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Question</label>
+              <textarea
+                value={chatData.prompt}
+                onChange={(e) => setChatData({ ...chatData, prompt: e.target.value })}
+                className="w-full h-24 px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-500"
+                placeholder="Enter the question..."
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Answer</label>
+              <textarea
+                value={chatData.response}
+                onChange={(e) => setChatData({ ...chatData, response: e.target.value })}
+                className="w-full h-24 px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-500"
+                placeholder="Enter the answer..."
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Source</label>
+                <input
+                  type="text"
+                  value={chatData.source}
+                  onChange={(e) => setChatData({ ...chatData, source: e.target.value })}
+                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">Model</label>
+                <input
+                  type="text"
+                  value={chatData.model}
+                  onChange={(e) => setChatData({ ...chatData, model: e.target.value })}
+                  className="w-full px-4 py-2 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-pink-500"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => chatMutation.mutate(chatData)}
+                disabled={!chatData.prompt || !chatData.response || chatMutation.isPending}
+                className="flex-1 px-6 py-3 bg-gradient-to-r from-pink-500 to-rose-500 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {chatMutation.isPending ? 'Logging...' : 'Log Chat'}
+              </button>
+              <button
+                onClick={onClose}
+                className="px-6 py-3 bg-white/5 text-gray-300 rounded-xl font-semibold hover:bg-white/10 transition-all"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </motion.div>
+    </motion.div>
+  )
+}
+
+export default function App() {
+  const { events, addEvent, setEvents, filteredEvents } = useEventStore()
+  const [searchQuery, setSearchQuery] = useState('')
+  const [showLogger, setShowLogger] = useState(false)
+  const [selectedKinds, setSelectedKinds] = useState<EventKind[]>([])
+
+  // Fetch initial events
+  const { data: eventsData } = useQuery({
+    queryKey: ['events'],
+    queryFn: () => fetchEvents({ limit: 100 }),
+  })
+
+  // Health check
+  const { data: health } = useQuery({
+    queryKey: ['health'],
+    queryFn: healthCheck,
+    refetchInterval: 10000,
+  })
+
+  // AI Matching mutation
+  const matchMutation = useMutation({
+    mutationFn: () => matchEvents({ include_kinds: ['prompt', 'copilot_chat', 'file_change'] }),
+    onSuccess: (data) => {
+      toast.success(`Found ${data.matches.length} matches!`, {
+        description: `Analyzed ${data.metadata.prompt_count} prompts and ${data.metadata.code_change_count} changes`,
+      })
+      confetti({
+        particleCount: 100,
+        spread: 70,
+        origin: { y: 0.6 },
+      })
+    },
+    onError: () => {
+      toast.error('Matching failed', {
+        description: 'Make sure OPENAI_API_KEY is set in .env file',
+      })
+    },
+  })
+
+  // Set initial events
+  useEffect(() => {
+    if (eventsData?.items) {
+      setEvents(eventsData.items)
+    }
+  }, [eventsData, setEvents])
+
+  // Connect to SSE stream
+  useEffect(() => {
+    const cleanup = createEventStream(
+      (event) => {
+        addEvent(event)
+        toast.success(`New ${event.kind}`, {
+          description: event.path || 'Activity logged',
+          duration: 2000,
+        })
+        confetti({
+          particleCount: 10,
+          spread: 30,
+          origin: { y: 0.2, x: Math.random() },
+        })
+      },
+      (error) => {
+        console.error('Stream error:', error)
+      }
+    )
+
+    return cleanup
+  }, [addEvent])
+
+  // Filter events
+  const displayEvents = filteredEvents().filter((event) => {
+    if (selectedKinds.length > 0 && !selectedKinds.includes(event.kind)) {
+      return false
+    }
+    if (searchQuery) {
+      const query = searchQuery.toLowerCase()
+      return JSON.stringify(event).toLowerCase().includes(query)
+    }
+    return true
+  })
+
+  const toggleKind = (kind: EventKind) => {
+    setSelectedKinds((prev) =>
+      prev.includes(kind) ? prev.filter((k) => k !== kind) : [...prev, kind]
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900">
+      <Toaster richColors position="top-right" />
+
+      {/* Header */}
+      <header className="sticky top-0 z-40 glass-dark border-b border-white/10 backdrop-blur-xl">
+        <div className="container mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 bg-gradient-to-br from-purple-500 to-pink-500 rounded-2xl flex items-center justify-center">
+                <Activity className="w-7 h-7 text-white" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-blue-400 bg-clip-text text-transparent">
+                  Code Monitor
+                </h1>
+                <p className="text-sm text-gray-400">Development Activity Tracker</p>
+              </div>
+            </div>
+
+            {health && (
+              <div className="px-4 py-2 bg-green-500/20 border border-green-500/30 rounded-xl">
+                <p className="text-sm text-green-300 font-semibold">
+                  {health.events} events tracked
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Search & Filters */}
+          <div className="mt-4 flex gap-3 flex-wrap">
+            <div className="flex-1 min-w-[200px]">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search events..."
+                  className="w-full pl-10 pr-4 py-2 bg-white/5 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+              </div>
+            </div>
+
+            <div className="flex gap-2 flex-wrap">
+              {(Object.keys(EVENT_CONFIG) as EventKind[]).map((kind) => {
+                const config = EVENT_CONFIG[kind]
+                const Icon = config.icon
+                const isSelected = selectedKinds.includes(kind)
+
+                return (
+                  <button
+                    key={kind}
+                    onClick={() => toggleKind(kind)}
+                    className={cn(
+                      'px-3 py-2 rounded-xl flex items-center gap-2 transition-all',
+                      isSelected
+                        ? `bg-gradient-to-r ${config.gradient} text-white shadow-lg`
+                        : 'bg-white/5 text-gray-400 hover:bg-white/10'
+                    )}
+                  >
+                    <Icon className="w-4 h-4" />
+                    <span className="text-sm font-medium">{config.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="container mx-auto px-4 py-8">
+        <div className="space-y-4">
+          <AnimatePresence mode="popLayout">
+            {displayEvents.length === 0 ? (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="text-center py-16"
+              >
+                <Activity className="w-16 h-16 text-gray-600 mx-auto mb-4" />
+                <p className="text-gray-400 text-lg">No events to display</p>
+                <p className="text-gray-500 text-sm mt-2">
+                  Start coding or log an activity to see events here
+                </p>
+              </motion.div>
+            ) : (
+              displayEvents.map((event) => <EventCard key={event.id || event.ts} event={event} />)
+            )}
+          </AnimatePresence>
+        </div>
+      </main>
+
+      {/* Floating Action Buttons */}
+      <div className="fixed bottom-8 right-8 flex flex-col gap-3">
+        <motion.button
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => setShowLogger(true)}
+          className="w-14 h-14 bg-gradient-to-r from-purple-500 to-pink-500 rounded-full flex items-center justify-center shadow-2xl hover:shadow-purple-500/50 transition-all"
+        >
+          <Plus className="w-7 h-7 text-white" />
+        </motion.button>
+
+        <motion.button
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => matchMutation.mutate()}
+          disabled={matchMutation.isPending}
+          className="px-5 py-3 bg-gradient-to-r from-violet-500 via-fuchsia-500 to-pink-500 rounded-full flex items-center gap-2 shadow-2xl hover:shadow-fuchsia-500/50 transition-all text-white font-semibold disabled:opacity-50"
+        >
+          <motion.div
+            animate={matchMutation.isPending ? { rotate: 360 } : {}}
+            transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
+          >
+            <Sparkles className="w-5 h-5" />
+          </motion.div>
+          <span className="whitespace-nowrap">
+            {matchMutation.isPending ? 'AI Thinking...' : 'Find Related Code'}
+          </span>
+        </motion.button>
+      </div>
+
+      {/* Logger Modal */}
+      <AnimatePresence>{showLogger && <LoggerModal onClose={() => setShowLogger(false)} />}</AnimatePresence>
+    </div>
+  )
+}

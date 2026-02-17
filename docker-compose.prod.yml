@@ -1,9 +1,16 @@
+version: '3.8'
+
 services:
-  code-agent:
-    build: ./.agent
+  code-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: code-monitor-prod
     volumes:
       - .:/workspace:ro
       - ./.agent/data:/data
+      # Mount your projects directory - UPDATE THIS PATH if your projects are elsewhere
+      - /Users/subhagatoadak/Documents/github:/projects:ro
     environment:
       REPO_PATH: /workspace
       DB_PATH: /data/events.db
@@ -14,7 +21,12 @@ services:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       OPENAI_MATCHING_MODEL: ${OPENAI_MATCHING_MODEL:-gpt-4o}
       CORS_ENABLED: ${CORS_ENABLED:-false}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
     ports:
       - "4381:4381"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4381/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
